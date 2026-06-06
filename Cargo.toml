@@ -1,0 +1,7 @@
+[package]
+name = "ternary-sketch"
+version = "0.1.0"
+edition = "2021"
+description = "Ternary sketch data structure for approximate GPU workload analysis. Count-Min sketch with ternary counters {-1,0,+1} for streaming frequency estimation."
+license = "Apache-2.0"
+repository = "https://github.com/SuperInstance/ternary-sketch"
