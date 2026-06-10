@@ -1,90 +1,69 @@
 # ternary-sketch
 
-Ternary sketch data structure for approximate GPU workload analysis. Count-Min sketch with ternary counters {-1,0,+1} for streaming frequency estimation.
+Count-Min sketch with ternary counters for approximate GPU workload analysis.
 
-## Why This Matters
+## Why This Exists
 
-# ternary-sketch
-Ternary sketch for approximate GPU workload analysis.
-Count-Min sketch with ternary counters.
+When you're monitoring thousands of GPU kernel types across a fleet, you can't track exact counts for everything. Sketch data structures give you approximate frequency estimation in bounded space. But binary counters in a Count-Min sketch can only count up. Ternary counters (+1, 0, -1) let you **both insert and remove** items — tracking frequency deltas, not just totals. This means you can detect which kernels are heating up (net positive), stable (net zero), or cooling down (net negative).
 
-## The Five-Layer Stack
+## Architecture
 
-This crate is part of the **Oxide Stack** — a distributed GPU runtime built on five layers:
+### Core Types
 
-```
-┌─────────────────┐
-│  cudaclaw        │  Persistent GPU kernels, warp consensus, SmartCRDT
-├─────────────────┤
-│  cuda-oxide      │  Flux → MIR → Pliron → NVVM → PTX compiler
-├─────────────────┤
-│  flux-core       │  Bytecode VM + A2A agent protocol
-├─────────────────┤
-│  pincher         │  "Vector DB as runtime, LLM as compiler"
-├─────────────────┤
-│  open-parallel   │  Async runtime (tokio fork)
-└─────────────────┘
-```
+- **`TernarySketch`** — A 2D array of ternary counters (`i8`) with configurable `width` and `depth`. Multiple hash functions map items to different rows.
+- Each cell stores a ternary value: positive (overrepresented), zero (baseline), negative (underrepresented).
 
-The key insight: **ternary values {-1, 0, +1} map directly to GPU compute**. They pack 16× denser than FP32, enable XNOR+popcount matmul, and conservation laws become compile-time checks.
+### Key Algorithms
 
-## Design
-
-Every value in this crate follows **ternary algebra** (Z₃):
-
-| Value | Meaning | GPU Analog |
-|-------|---------|------------|
-| +1 | Positive / Active / Healthy | Warp vote yes |
-| 0 | Neutral / Pending / Balanced | Warp vote abstain |
-| -1 | Negative / Failed / Overloaded | Warp vote no |
-
-This isn't arbitrary — ternary is the natural encoding for:
-1. **BitNet b1.58** (Microsoft) — ternary LLMs at 60% less power
-2. **GPU warp voting** — hardware ballot returns ternary consensus
-3. **Conservation laws** — {-1, 0, +1} preserves quantity
-
-## Key Types
-
-```rust
-pub struct TernarySketch
-pub fn new
-pub fn insert
-pub fn remove
-pub fn estimate
-pub fn heavy_hitters
-pub fn merge
-pub fn fill_rate
-pub fn total_updates
-```
+- **insert**: Hash item to `depth` positions, increment each cell (clamped to ±1).
+- **remove**: Same but decrement — useful for sliding windows.
+- **estimate**: Return the minimum across all hash positions.
+- **heavy_hitters**: Among candidates, return those exceeding a ternary threshold.
+- **merge**: Combine two sketches pointwise (max).
 
 ## Usage
 
-```toml
-[dependencies]
-ternary-sketch = "0.1.0"
-```
-
 ```rust
-use ternary_sketch::*;
-// See src/lib.rs tests for complete working examples
+use ternary_sketch::TernarySketch;
+
+let mut sketch = TernarySketch::new(1024, 5); // 1024 wide, 5 hash functions
+
+sketch.insert(b"kernel::matmul_4096");
+sketch.insert(b"kernel::matmul_4096");
+sketch.insert(b"kernel::layernorm");
+
+let freq = sketch.estimate(b"kernel::matmul_4096");
+assert!(freq > 0); // overrepresented
+
+// Remove to simulate sliding window
+sketch.remove(b"kernel::matmul_4096");
+
+// Heavy hitter detection
+let hitters = sketch.heavy_hitters(
+    &[b"kernel::matmul_4096".to_vec(), b"kernel::layernorm".to_vec()],
+    0, // threshold: anything above 0
+);
 ```
 
-## Testing
+## API Reference
 
-```bash
-git clone https://github.com/SuperInstance/ternary-sketch.git
-cd ternary-sketch
-cargo test    # 7 tests
-```
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `new(width, depth)` | `TernarySketch` | Create sketch with given dimensions |
+| `insert(item)` | `()` | Increment item's counters |
+| `remove(item)` | `()` | Decrement item's counters |
+| `estimate(item)` | `i8` | Approximate frequency (min across hashes) |
+| `heavy_hitters(candidates, threshold)` | `Vec<usize>` | Indices of items above threshold |
+| `merge(other)` | `()` | Merge another sketch into this one |
+| `fill_rate()` | `f64` | Fraction of non-zero cells |
+| `total_updates()` | `u64` | Total insert + remove operations |
 
-## Stats
+## The Deeper Idea
 
-| Metric | Value |
-|--------|-------|
-| Tests | 7 |
-| Lines of Rust | 133 |
-| Public API | 9 items |
+Ternary sketches are the **signal processing** of workload monitoring. Traditional Count-Min is a low-pass filter (it only accumulates). Ternary Count-Min is a band-pass filter — it shows you what's changing, not just what's large. Items that have been inserted many times but also removed many times show as zero, which is the correct answer: "this used to be hot, now it's not." This makes ternary sketches ideal for adaptive scheduling where you care about trends, not totals.
 
-## License
+## Related Crates
 
-Apache-2.0
+- **ternary-bloom-filter** — membership testing with ternary weighted bits
+- **ternary-search-index** — ternary-weighted document search
+- **ternary-accumulator** — ternary gradient accumulation
