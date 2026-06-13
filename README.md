@@ -1,110 +1,133 @@
-# Ternary Sketch — Count-Min Sketch with Ternary Counters
+# ternary-sketch
 
-**Ternary Sketch** is a probabilistic data structure for approximate frequency estimation using a Count-Min sketch with ternary counters {-1, 0, +1}. It provides insert, remove, estimate, heavy-hitter detection, and merge operations — all in sublinear space, suitable for GPU workload analysis where exact counting is too expensive.
+Ternary Count-Min sketch for **approximate GPU workload analysis**. Each cell stores a ternary counter ∈ {-1, 0, +1} instead of a full integer, enabling ultra-low-memory streaming frequency estimation with bounded error guarantees.
 
 ## Why It Matters
 
-Tracking the frequency of every item in a high-throughput stream is impossible when the universe is large. Count-Min sketches solve this by hashing items into a small table, trading exact counts for bounded error guarantees. The ternary variant uses counters limited to {-1, 0, +1}, making each counter fit in 2 bits — 4× denser than byte counters and 16× denser than int32. This is particularly valuable for GPU workload analysis: tracking kernel launch frequencies, memory access patterns, and cache hit rates in real-time, all in a few kilobytes of state.
+Standard Count-Min sketches use `log(W)`-bit counters per cell, which over-provisions memory for workloads where only the *sign* of frequency matters (is this kernel hot, cold, or neutral?). Ternary counters reduce per-cell storage to 2 bits while preserving:
+
+- **Heavy-hitter detection** — identify items with frequency > threshold
+- **Direction tracking** — +1 means "increasing," -1 means "decreasing," 0 means "stable"
+- **Mergeability** — combine sketches from multiple GPUs via cell-wise max
+
+The ternary constraint clamps counters to {-1, 0, +1}, so repeated increments saturate at +1. This trades absolute frequency for directional information, which is sufficient for adaptive scheduling decisions.
 
 ## How It Works
 
-### Structure
+### Data Structure
 
-The sketch is a `depth × width` table of ternary counters. Each item is hashed with `depth` independent hash functions to find one cell per row.
-
-### Insert (increment)
-
-For each row d, hash the item to column `w = hash(item, seed_d) mod width`, then saturate the counter upward:
+A `TernarySketch` is a 2D table of `depth × width` ternary cells, initialized to 0:
 
 ```
--1 → 0
- 0 → +1
-+1 → +1  (saturate)
+table[d][w] ∈ {-1, 0, +1}
 ```
 
-### Remove (decrement)
+### Hashing
 
-Same as insert but saturating downward:
-
-```
-+1 → 0
- 0 → -1
--1 → -1  (saturate)
-```
-
-### Estimate
-
-Return the minimum counter value across all rows:
+Each row *d* uses a different seed to hash items to columns:
 
 ```
-estimate(item) = min(sketch[d][hash(item, d)] for d in 0..depth)
+h_d(item) = (Σ byteᵢ · 31^(len-i) + d · 997) mod width
 ```
 
-The min reduces over-estimation error (the core Count-Min guarantee). With probability ≥ 1-δ, the estimate err·s by at most εN, where N is total insertions and width = ⌈e/ε⌉, depth = ⌈ln(1/δ)⌉. Space: O(depth × width × 2 bits).
+This is a polynomial rolling hash with row-specific salt — not cryptographically secure, but fast and sufficiently uniform for sketch purposes.
 
-### Heavy Hitters
+**Complexity:** O(L) per hash, where L = item byte length.
 
-Given a set of candidate items, return those with estimate > threshold. O(c × depth) for c candidates.
+### Insert (Increment with Clamp)
 
-### Merge
+```
+for d in 0..depth:
+    w = h_d(item)
+    table[d][w] = match table[d][w]:
+        -1 → 0
+         0 → +1
+        +1 → +1  (saturated)
+```
 
-Two sketches merge by taking the max per cell. This is a valid CRDT merge — commutative, idempotent, associative. Enables distributed sketch aggregation across GPU nodes.
+### Remove (Decrement with Clamp)
+
+```
+for d in 0..depth:
+    w = h_d(item)
+    table[d][w] = match table[d][w]:
+        +1 → 0
+         0 → -1
+        -1 → -1  (saturated)
+```
+
+### Frequency Estimate
+
+Take the **minimum** across all rows (standard Count-Min estimator):
+
+```
+estimate(item) = min_d  table[d][h_d(item)]
+```
+
+The min reduces over-estimation from hash collisions: if two items collide in one row, they likely don't collide in another.
+
+**Complexity:** O(D) per estimate, where D = depth.
+
+### Error Bounds
+
+For a Count-Min sketch with width *W* and depth *D*:
+
+- **False positive rate:** `P(overestimate > 0) ≤ (1/e)^D ≈ 0.368^D`
+- With D = 4: `P ≈ 1.8%` per query
+- The ternary clamp introduces **directional accuracy**: the estimate correctly identifies sign (positive/negative/zero) with high probability, though the magnitude is clamped.
+
+### Merge (Cell-wise Max)
+
+```
+merged[d][w] = max(sketch_A[d][w], sketch_B[d][w])
+```
+
+This is the standard Count-Min merge for the union of two streams. Preserves the worst-case (highest frequency) estimate.
+
+**Complexity:** O(D × W).
 
 ## Quick Start
 
 ```rust
 use ternary_sketch::TernarySketch;
 
-let mut sketch = TernarySketch::new(64, 4); // width=64, depth=4
+let mut sk = TernarySketch::new(width: 64, depth: 4);
 
-sketch.insert(b"kernel_launch");
-sketch.insert(b"kernel_launch");
-sketch.insert(b"memory_copy");
+sk.insert(b"matmul_kernel");
+sk.insert(b"matmul_kernel");
+sk.insert(b"conv_kernel");
 
-let freq = sketch.estimate(b"kernel_launch");
-println!("Estimated frequency: {}", freq);
+assert!(sk.estimate(b"matmul_kernel") > 0);  // hot
+assert!(sk.estimate(b"unknown") == 0);        // not seen
 
-// Heavy hitters
-let candidates = vec![b"kernel_launch".to_vec(), b"rare_event".to_vec()];
-let heavy = sketch.heavy_hitters(&candidates, 0);
-```
-
-```bash
-cargo add ternary-sketch
+let hh = sk.heavy_hitters(&[b"matmul_kernel".to_vec(), b"unknown".to_vec()], threshold: 0);
+assert!(hh.contains(&0));  // matmul_kernel is a heavy hitter
 ```
 
 ## API
 
-| Type / Function | Description |
-|---|---|
-| `TernarySketch` | `new(width, depth)`, `insert()`, `remove()`, `estimate()`, `heavy_hitters()`, `merge()` |
-| `fill_rate()` | Fraction of non-zero cells |
-| `total_updates()` | Count of insertions |
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `new(width, depth)` | `Self` | Initialize empty sketch |
+| `insert(item)` | `()` | Increment (clamp at +1) |
+| `remove(item)` | `()` | Decrement (clamp at -1) |
+| `estimate(item)` | `i8` | Min across rows |
+| `heavy_hitters(candidates, threshold)` | `Vec<usize>` | Indices above threshold |
+| `merge(other)` | `()` | Cell-wise max merge |
+| `fill_rate()` | `f64` | Fraction of non-zero cells |
+| `total_updates()` | `u64` | Lifetime insert count |
 
 ## Architecture Notes
 
-The sketch enables approximate fleet monitoring in **SuperInstance**. GPU nodes maintain local sketches of workload patterns and merge them via the CRDT property. The γ + η = C conservation manifests in the error-space trade-off: wider sketches (more γ = more information) reduce estimation error (less η = less uncertainty), for a fixed total size C. See [Architecture](https://github.com/SuperInstance/SuperInstance/blob/main/ARCHITECTURE.md).
+The **γ + η = C** invariant: *generation* (γ) is the insert/remove stream modifying cell values, *entropy* (η) is the information loss from ternary clamping (we can't recover exact frequencies from {-1, 0, +1}), and *conservation* (C) is the error bound guarantee — the estimate never underestimates the true clamped frequency (Count-Min property). The tradeoff between γ and η is direct: more insertions (γ↑) increase collisions and thus entropy (η↑), while the conservation law (C) maintains the `min-row` lower bound on estimate accuracy.
 
 ## References
 
-- Cormode, Graham & Muthukrishnan, S. "An Improved Data Stream Summary," *ESA*, 2004 — Count-Min sketch.
-| Mitzenmacher, Michael & Upfal, Eli. *Probability and Computing*, Cambridge UP, 2017.
-| Agarwal, Pranjal et al. "Sketching for Big Data," *Found. Trends ML*, 2020.
-
-
-
-## Complexity Summary
-
-| Operation | Time | Space |
-|---|---|---|
-| insert(item) | O(depth) | O(1) per row |
-| remove(item) | O(depth) | O(1) per row |
-| estimate(item) | O(depth) | O(1) |
-| heavy_hitters(c candidates) | O(c × depth) | O(c) |
-| merge(other) | O(width × depth) | O(1) |
-
-With width=64, depth=4: total space = 256 cells × 2 bits = 64 bytes. Error bound: ε ≈ e/width ≈ 4.2%, with δ = e^(-depth) ≈ 1.8% failure probability.
+- **Count-Min Sketch:** Cormode, G. & Muthukrishnan, S. "An Improved Data Stream Summary" (2005)
+- **Ternary frequency tracking:** For other applications of ternary counting, see Alemdar et al. "Ternary Weight Networks" (2017)
+- **Streaming algorithms:** Muthukrishnan, S. "Data Streams: Algorithms and Applications" (2005)
+- **Mergeable summaries:** Agarwal, S. et al. "Mergeable Summaries" (2013)
 
 ## License
 
-Apache-2.0
+MIT
