@@ -91,6 +91,20 @@ The sketch enables approximate fleet monitoring in **SuperInstance**. GPU nodes 
 | Mitzenmacher, Michael & Upfal, Eli. *Probability and Computing*, Cambridge UP, 2017.
 | Agarwal, Pranjal et al. "Sketching for Big Data," *Found. Trends ML*, 2020.
 
+
+
+## Complexity Summary
+
+| Operation | Time | Space |
+|---|---|---|
+| insert(item) | O(depth) | O(1) per row |
+| remove(item) | O(depth) | O(1) per row |
+| estimate(item) | O(depth) | O(1) |
+| heavy_hitters(c candidates) | O(c × depth) | O(c) |
+| merge(other) | O(width × depth) | O(1) |
+
+With width=64, depth=4: total space = 256 cells × 2 bits = 64 bytes. Error bound: ε ≈ e/width ≈ 4.2%, with δ = e^(-depth) ≈ 1.8% failure probability.
+
 ## License
 
 Apache-2.0
