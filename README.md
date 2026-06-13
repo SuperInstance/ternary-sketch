@@ -1,69 +1,96 @@
-# ternary-sketch
+# Ternary Sketch — Count-Min Sketch with Ternary Counters
 
-Count-Min sketch with ternary counters for approximate GPU workload analysis.
+**Ternary Sketch** is a probabilistic data structure for approximate frequency estimation using a Count-Min sketch with ternary counters {-1, 0, +1}. It provides insert, remove, estimate, heavy-hitter detection, and merge operations — all in sublinear space, suitable for GPU workload analysis where exact counting is too expensive.
 
-## Why This Exists
+## Why It Matters
 
-When you're monitoring thousands of GPU kernel types across a fleet, you can't track exact counts for everything. Sketch data structures give you approximate frequency estimation in bounded space. But binary counters in a Count-Min sketch can only count up. Ternary counters (+1, 0, -1) let you **both insert and remove** items — tracking frequency deltas, not just totals. This means you can detect which kernels are heating up (net positive), stable (net zero), or cooling down (net negative).
+Tracking the frequency of every item in a high-throughput stream is impossible when the universe is large. Count-Min sketches solve this by hashing items into a small table, trading exact counts for bounded error guarantees. The ternary variant uses counters limited to {-1, 0, +1}, making each counter fit in 2 bits — 4× denser than byte counters and 16× denser than int32. This is particularly valuable for GPU workload analysis: tracking kernel launch frequencies, memory access patterns, and cache hit rates in real-time, all in a few kilobytes of state.
 
-## Architecture
+## How It Works
 
-### Core Types
+### Structure
 
-- **`TernarySketch`** — A 2D array of ternary counters (`i8`) with configurable `width` and `depth`. Multiple hash functions map items to different rows.
-- Each cell stores a ternary value: positive (overrepresented), zero (baseline), negative (underrepresented).
+The sketch is a `depth × width` table of ternary counters. Each item is hashed with `depth` independent hash functions to find one cell per row.
 
-### Key Algorithms
+### Insert (increment)
 
-- **insert**: Hash item to `depth` positions, increment each cell (clamped to ±1).
-- **remove**: Same but decrement — useful for sliding windows.
-- **estimate**: Return the minimum across all hash positions.
-- **heavy_hitters**: Among candidates, return those exceeding a ternary threshold.
-- **merge**: Combine two sketches pointwise (max).
+For each row d, hash the item to column `w = hash(item, seed_d) mod width`, then saturate the counter upward:
 
-## Usage
+```
+-1 → 0
+ 0 → +1
++1 → +1  (saturate)
+```
+
+### Remove (decrement)
+
+Same as insert but saturating downward:
+
+```
++1 → 0
+ 0 → -1
+-1 → -1  (saturate)
+```
+
+### Estimate
+
+Return the minimum counter value across all rows:
+
+```
+estimate(item) = min(sketch[d][hash(item, d)] for d in 0..depth)
+```
+
+The min reduces over-estimation error (the core Count-Min guarantee). With probability ≥ 1-δ, the estimate err·s by at most εN, where N is total insertions and width = ⌈e/ε⌉, depth = ⌈ln(1/δ)⌉. Space: O(depth × width × 2 bits).
+
+### Heavy Hitters
+
+Given a set of candidate items, return those with estimate > threshold. O(c × depth) for c candidates.
+
+### Merge
+
+Two sketches merge by taking the max per cell. This is a valid CRDT merge — commutative, idempotent, associative. Enables distributed sketch aggregation across GPU nodes.
+
+## Quick Start
 
 ```rust
 use ternary_sketch::TernarySketch;
 
-let mut sketch = TernarySketch::new(1024, 5); // 1024 wide, 5 hash functions
+let mut sketch = TernarySketch::new(64, 4); // width=64, depth=4
 
-sketch.insert(b"kernel::matmul_4096");
-sketch.insert(b"kernel::matmul_4096");
-sketch.insert(b"kernel::layernorm");
+sketch.insert(b"kernel_launch");
+sketch.insert(b"kernel_launch");
+sketch.insert(b"memory_copy");
 
-let freq = sketch.estimate(b"kernel::matmul_4096");
-assert!(freq > 0); // overrepresented
+let freq = sketch.estimate(b"kernel_launch");
+println!("Estimated frequency: {}", freq);
 
-// Remove to simulate sliding window
-sketch.remove(b"kernel::matmul_4096");
-
-// Heavy hitter detection
-let hitters = sketch.heavy_hitters(
-    &[b"kernel::matmul_4096".to_vec(), b"kernel::layernorm".to_vec()],
-    0, // threshold: anything above 0
-);
+// Heavy hitters
+let candidates = vec![b"kernel_launch".to_vec(), b"rare_event".to_vec()];
+let heavy = sketch.heavy_hitters(&candidates, 0);
 ```
 
-## API Reference
+```bash
+cargo add ternary-sketch
+```
 
-| Method | Returns | Description |
-|--------|---------|-------------|
-| `new(width, depth)` | `TernarySketch` | Create sketch with given dimensions |
-| `insert(item)` | `()` | Increment item's counters |
-| `remove(item)` | `()` | Decrement item's counters |
-| `estimate(item)` | `i8` | Approximate frequency (min across hashes) |
-| `heavy_hitters(candidates, threshold)` | `Vec<usize>` | Indices of items above threshold |
-| `merge(other)` | `()` | Merge another sketch into this one |
-| `fill_rate()` | `f64` | Fraction of non-zero cells |
-| `total_updates()` | `u64` | Total insert + remove operations |
+## API
 
-## The Deeper Idea
+| Type / Function | Description |
+|---|---|
+| `TernarySketch` | `new(width, depth)`, `insert()`, `remove()`, `estimate()`, `heavy_hitters()`, `merge()` |
+| `fill_rate()` | Fraction of non-zero cells |
+| `total_updates()` | Count of insertions |
 
-Ternary sketches are the **signal processing** of workload monitoring. Traditional Count-Min is a low-pass filter (it only accumulates). Ternary Count-Min is a band-pass filter — it shows you what's changing, not just what's large. Items that have been inserted many times but also removed many times show as zero, which is the correct answer: "this used to be hot, now it's not." This makes ternary sketches ideal for adaptive scheduling where you care about trends, not totals.
+## Architecture Notes
 
-## Related Crates
+The sketch enables approximate fleet monitoring in **SuperInstance**. GPU nodes maintain local sketches of workload patterns and merge them via the CRDT property. The γ + η = C conservation manifests in the error-space trade-off: wider sketches (more γ = more information) reduce estimation error (less η = less uncertainty), for a fixed total size C. See [Architecture](https://github.com/SuperInstance/SuperInstance/blob/main/ARCHITECTURE.md).
 
-- **ternary-bloom-filter** — membership testing with ternary weighted bits
-- **ternary-search-index** — ternary-weighted document search
-- **ternary-accumulator** — ternary gradient accumulation
+## References
+
+- Cormode, Graham & Muthukrishnan, S. "An Improved Data Stream Summary," *ESA*, 2004 — Count-Min sketch.
+| Mitzenmacher, Michael & Upfal, Eli. *Probability and Computing*, Cambridge UP, 2017.
+| Agarwal, Pranjal et al. "Sketching for Big Data," *Found. Trends ML*, 2020.
+
+## License
+
+Apache-2.0
